@@ -1,0 +1,174 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 1.0.0)'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark as pre-release'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  VERSION: ${{ inputs.version }}
+
+jobs:
+  build:
+    name: Build, Sign, and Notarize
+    runs-on: macos-14  # Apple Silicon runner
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Create virtual environment and install dependencies
+        run: |
+          uv venv .venv
+          source .venv/bin/activate
+          uv pip install -r requirements.txt
+          uv pip install pyinstaller
+
+      - name: Verify MLX is available
+        run: |
+          source .venv/bin/activate
+          python -c "import mlx; print('MLX version:', mlx.__version__)"
+
+      - name: Build with PyInstaller
+        run: |
+          source .venv/bin/activate
+          pyinstaller docling_vlm_sidecar.spec --noconfirm
+          echo "Build complete. Bundle size:"
+          du -sh dist/docling_vlm_sidecar
+
+      - name: Apply APFS compression
+        run: |
+          # Create compressed copy
+          ditto --hfsCompression dist/docling_vlm_sidecar dist/docling_vlm_sidecar_compressed
+          rm -rf dist/docling_vlm_sidecar
+          mv dist/docling_vlm_sidecar_compressed dist/docling_vlm_sidecar
+          echo "Compressed bundle size:"
+          du -sh dist/docling_vlm_sidecar
+
+      - name: Import signing certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          # Create temporary keychain
+          KEYCHAIN_PATH=$RUNNER_TEMP/signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import certificate
+          echo "$APPLE_CERTIFICATE" | base64 --decode > $RUNNER_TEMP/certificate.p12
+          security import $RUNNER_TEMP/certificate.p12 \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+
+          # Set keychain for codesign
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Find signing identity
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep "Developer ID Application" | head -1 | awk -F'"' '{print $2}')
+          echo "SIGNING_IDENTITY=$IDENTITY" >> $GITHUB_ENV
+          echo "Found signing identity: $IDENTITY"
+
+      - name: Sign all binaries
+        run: |
+          SIDECAR_DIR="dist/docling_vlm_sidecar"
+          INTERNAL_DIR="$SIDECAR_DIR/_internal"
+
+          echo "Clearing extended attributes..."
+          xattr -cr "$SIDECAR_DIR"
+
+          echo "Signing .dylib files..."
+          find "$INTERNAL_DIR" -name "*.dylib" -exec codesign --force --sign "$SIGNING_IDENTITY" --timestamp --options runtime {} \;
+
+          echo "Signing .so files..."
+          find "$INTERNAL_DIR" -name "*.so" -exec codesign --force --sign "$SIGNING_IDENTITY" --timestamp --options runtime {} \;
+
+          echo "Signing frameworks..."
+          find "$INTERNAL_DIR" -name "*.framework" -type d -exec codesign --force --deep --sign "$SIGNING_IDENTITY" --timestamp --options runtime {} \;
+
+          echo "Signing Python library..."
+          if ls "$INTERNAL_DIR"/libpython*.dylib 1> /dev/null 2>&1; then
+            codesign --force --sign "$SIGNING_IDENTITY" --timestamp --options runtime "$INTERNAL_DIR"/libpython*.dylib
+          fi
+
+          echo "Signing main executable with entitlements..."
+          codesign --force --sign "$SIGNING_IDENTITY" --timestamp --options runtime --entitlements sidecar.entitlements "$SIDECAR_DIR/docling_vlm_sidecar"
+
+          echo "Verifying signature..."
+          codesign -dvv "$SIDECAR_DIR/docling_vlm_sidecar"
+
+      - name: Create ZIP for notarization
+        run: |
+          cd dist
+          ditto -c -k --keepParent docling_vlm_sidecar "docling_vlm_sidecar-${VERSION}-macos-arm64.zip"
+          echo "Archive created:"
+          ls -lh *.zip
+
+      - name: Notarize
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          echo "Submitting for notarization..."
+          xcrun notarytool submit \
+            "dist/docling_vlm_sidecar-${VERSION}-macos-arm64.zip" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+          echo "Stapling notarization ticket..."
+          xcrun stapler staple dist/docling_vlm_sidecar/docling_vlm_sidecar
+
+          # Re-create ZIP with stapled binary
+          cd dist
+          rm "docling_vlm_sidecar-${VERSION}-macos-arm64.zip"
+          ditto -c -k --keepParent docling_vlm_sidecar "docling_vlm_sidecar-${VERSION}-macos-arm64.zip"
+
+      - name: Verify notarization
+        run: |
+          spctl -a -vv dist/docling_vlm_sidecar/docling_vlm_sidecar || true
+          xcrun stapler validate dist/docling_vlm_sidecar/docling_vlm_sidecar
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          name: v${{ inputs.version }}
+          prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: true
+          files: |
+            dist/docling_vlm_sidecar-${{ inputs.version }}-macos-arm64.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          security delete-keychain $RUNNER_TEMP/signing.keychain-db || true

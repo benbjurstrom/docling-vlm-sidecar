@@ -1,0 +1,18 @@
+# Docling VLM Sidecar - Minimal dependencies
+# Uses MLX instead of PyTorch for smaller bundle size
+
+# Core VLM inference
+mlx-vlm>=0.1.0
+
+# Document structure and export
+docling-core>=2.0.0
+
+# Image handling
+pillow>=10.0.0
+
+# Required by mlx-vlm (will be installed as dependencies)
+# mlx - Apple's ML framework
+# transformers - for tokenizers/configs (no torch required)
+
+# Build tools (dev only, not bundled)
+pyinstaller>=6.0.0

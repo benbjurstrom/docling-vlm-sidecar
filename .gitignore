@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+
+# PyInstaller
+build/
+dist/
+*.spec.bak
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+*.dSYM/
+
+# Logs
+*.log
+
+# Local development
+.env
+.env.local
